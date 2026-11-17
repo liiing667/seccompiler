@@ -44,6 +44,10 @@ pub enum Error {
     IdenticalActions,
     /// Argument index of a `SeccompCondition` exceeds the maximum linux syscall index.
     InvalidArgumentNumber,
+    /// The value of a `SeccompCondition` does not fit in the argument width.
+    InvalidConditionValue,
+    /// The mask of a `SeccompCmpOp::MaskedEq` condition does not fit in the argument width.
+    InvalidConditionMask,
     /// Invalid TargetArch.
     InvalidTargetArch(String),
 }
@@ -69,6 +73,18 @@ impl Display for Error {
                     f,
                     "The seccomp rule contains an invalid argument index. Maximum index value: {}",
                     ARG_NUMBER_MAX
+                )
+            }
+            InvalidConditionValue => {
+                write!(
+                    f,
+                    "The seccomp condition value does not fit in the argument width."
+                )
+            }
+            InvalidConditionMask => {
+                write!(
+                    f,
+                    "The seccomp masked_eq condition mask does not fit in the argument width."
                 )
             }
             InvalidTargetArch(arch) => write!(f, "Invalid target arch: {}.", arch),

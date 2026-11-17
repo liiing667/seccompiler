@@ -60,6 +60,23 @@ impl SeccompCondition {
             return Err(Error::InvalidArgumentNumber);
         }
 
+        // Checks that the comparison value and the mask fit in the declared argument width.
+        // A `Dword` condition only compares the least significant 4 bytes of the syscall
+        // argument, so silently truncating a wider value (or mask) would make a single rule
+        // match arguments with arbitrary upper halves and widen the sandbox. Reject such
+        // inputs explicitly instead.
+        if let SeccompCmpArgLen::Dword = self.arg_len {
+            if self.value > u64::from(u32::MAX) {
+                return Err(Error::InvalidConditionValue);
+            }
+
+            if let SeccompCmpOp::MaskedEq(mask) = self.operator {
+                if mask > u64::from(u32::MAX) {
+                    return Err(Error::InvalidConditionMask);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -352,5 +369,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cond.split_value(), (1, 0));
+    }
+
+    #[test]
+    fn test_condition_value_width() {
+        // Boundary table: a condition must explicitly fail when its comparison value does not
+        // fit in the declared argument width, while qword keeps accepting the full u64 range.
+        for op in [
+            SeccompCmpOp::Eq,
+            SeccompCmpOp::Ne,
+            SeccompCmpOp::Ge,
+            SeccompCmpOp::Gt,
+            SeccompCmpOp::Le,
+            SeccompCmpOp::Lt,
+            SeccompCmpOp::MaskedEq(u64::from(u32::MAX)),
+        ] {
+            // The largest value that fits in a dword is accepted for both widths.
+            assert!(
+                SeccompCondition::new(0, SeccompCmpArgLen::Dword, op.clone(), u32::MAX.into())
+                    .is_ok()
+            );
+            assert!(
+                SeccompCondition::new(0, SeccompCmpArgLen::Qword, op.clone(), u32::MAX.into())
+                    .is_ok()
+            );
+
+            // Anything wider is rejected for dword conditions.
+            assert_eq!(
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    op.clone(),
+                    u64::from(u32::MAX) + 1
+                )
+                .unwrap_err(),
+                Error::InvalidConditionValue
+            );
+            assert!(SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Qword,
+                op.clone(),
+                u64::from(u32::MAX) + 1
+            )
+            .is_ok());
+
+            // The full u64 range remains available for qword conditions.
+            assert!(
+                SeccompCondition::new(0, SeccompCmpArgLen::Qword, op.clone(), u64::MAX).is_ok()
+            );
+            assert_eq!(
+                SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, u64::MAX).unwrap_err(),
+                Error::InvalidConditionValue
+            );
+        }
+    }
+
+    #[test]
+    fn test_masked_eq_mask_width() {
+        // A dword mask is accepted up to u32::MAX, including the all-ones dword mask.
+        assert!(SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(u32::MAX.into()),
+            0
+        )
+        .is_ok());
+
+        // A mask wider than 32 bits cannot be expressed by the dword BPF comparison and must
+        // fail explicitly rather than being silently truncated.
+        assert_eq!(
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(u64::from(u32::MAX) + 1),
+                0
+            )
+            .unwrap_err(),
+            Error::InvalidConditionMask
+        );
+        assert_eq!(
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(1 << 32),
+                0
+            )
+            .unwrap_err(),
+            Error::InvalidConditionMask
+        );
+
+        // The qword width keeps supporting the full u64 mask range.
+        assert!(SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(u64::MAX),
+            u64::MAX
+        )
+        .is_ok());
     }
 }

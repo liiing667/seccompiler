@@ -1,5 +1,15 @@
 # Upcoming Release
 
+## Fixed
+
+- `SeccompCondition`s with `SeccompCmpArgLen::Dword` now reject comparison
+  values and `masked_eq` masks that do not fit in 32 bits. Previously the
+  upper 32 bits were silently ignored by the generated BPF program, which
+  could make a single rule match arguments with arbitrary upper halves and
+  widen the sandbox beyond the declared policy. Qword conditions, the JSON
+  fields and the generated BPF instructions are unchanged.
+  New errors: `Error::InvalidConditionValue` and `Error::InvalidConditionMask`.
+
 # v0.5.0
 
 ## Added

@@ -347,6 +347,50 @@ mod tests {
             Error::Backend(BackendError::InvalidArgumentNumber)
         ));
 
+        // Dword conditions must reject values that do not fit in 32 bits.
+        let wide_dword_value_filter = JsonFilter::new(
+            SeccompAction::Allow,
+            SeccompAction::Trap,
+            vec![JsonRule::new(
+                "read".to_string(),
+                Some(vec![JsonCondition::new(
+                    0,
+                    Dword,
+                    Eq,
+                    u64::from(u32::MAX) + 1,
+                )]),
+            )],
+        );
+
+        assert!(matches!(
+            compiler
+                .make_seccomp_filter(wide_dword_value_filter)
+                .unwrap_err(),
+            Error::Backend(BackendError::InvalidConditionValue)
+        ));
+
+        // Dword masked_eq conditions must also reject masks that do not fit in 32 bits.
+        let wide_dword_mask_filter = JsonFilter::new(
+            SeccompAction::Allow,
+            SeccompAction::Trap,
+            vec![JsonRule::new(
+                "read".to_string(),
+                Some(vec![JsonCondition::new(
+                    0,
+                    Dword,
+                    MaskedEq(u64::from(u32::MAX) + 1),
+                    0,
+                )]),
+            )],
+        );
+
+        assert!(matches!(
+            compiler
+                .make_seccomp_filter(wide_dword_mask_filter)
+                .unwrap_err(),
+            Error::Backend(BackendError::InvalidConditionMask)
+        ));
+
         // Test that `SeccompRule` validations are triggered and caught by the compilation.
         let empty_rule_filter = JsonFilter::new(
             SeccompAction::Allow,
