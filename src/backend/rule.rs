@@ -1,7 +1,108 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-use crate::backend::{bpf::*, condition::SeccompCondition, Error, Result};
+use std::collections::{BTreeMap, HashSet};
+
+use crate::backend::{
+    bpf::*, condition::SeccompCondition, Error, Result, SeccompCmpArgLen, SeccompCmpOp,
+};
+
+/// Checks whether a set of conditions on the same syscall argument can be simultaneously
+/// satisfied.
+///
+/// The `eq`, `ge`, `gt`, `le` and `lt` conditions are combined into an inclusive
+/// `[lower, upper]` interval (plus an optional exact value), which is then checked against the
+/// `ne` exclusions and the `masked_eq` bit constraints.
+fn constraints_satisfiable(conditions: &[&SeccompCondition]) -> bool {
+    // Inclusive bounds of the interval the argument value must belong to.
+    let mut lower: u64 = 0;
+    let mut upper: u64 = u64::MAX;
+    // Exact value imposed by `eq` conditions, if any.
+    let mut eq_value: Option<u64> = None;
+    // Values excluded by `ne` conditions.
+    let mut ne_values: HashSet<u64> = HashSet::new();
+    // Bit constraints imposed by `masked_eq` conditions: (mask, masked value) pairs.
+    let mut masked_eqs: Vec<(u64, u64)> = Vec::new();
+
+    for condition in conditions {
+        let value = condition.value();
+        match condition.operator() {
+            SeccompCmpOp::Eq => {
+                if let Some(previous) = eq_value {
+                    if previous != value {
+                        return false;
+                    }
+                } else {
+                    eq_value = Some(value);
+                }
+            }
+            SeccompCmpOp::Ne => {
+                ne_values.insert(value);
+            }
+            SeccompCmpOp::Gt => match value.checked_add(1) {
+                Some(bound) => lower = lower.max(bound),
+                // No value can be greater than u64::MAX.
+                None => return false,
+            },
+            SeccompCmpOp::Ge => lower = lower.max(value),
+            SeccompCmpOp::Lt => match value.checked_sub(1) {
+                Some(bound) => upper = upper.min(bound),
+                // No value can be less than 0.
+                None => return false,
+            },
+            SeccompCmpOp::Le => upper = upper.min(value),
+            SeccompCmpOp::MaskedEq(mask) => masked_eqs.push((*mask, value & mask)),
+        }
+    }
+
+    if lower > upper {
+        return false;
+    }
+
+    // Two `masked_eq` conditions that constrain the same bits to different values contradict
+    // each other.
+    for (index, (mask, masked_value)) in masked_eqs.iter().enumerate() {
+        for (other_mask, other_masked_value) in &masked_eqs[index + 1..] {
+            let common_bits = mask & other_mask;
+            if masked_value & common_bits != other_masked_value & common_bits {
+                return false;
+            }
+        }
+    }
+
+    if let Some(value) = eq_value {
+        // The exact value must fit the interval, not be excluded and satisfy the bit
+        // constraints.
+        return value >= lower
+            && value <= upper
+            && !ne_values.contains(&value)
+            && masked_eqs
+                .iter()
+                .all(|(mask, masked_value)| value & mask == *masked_value);
+    }
+
+    // The interval must contain at least one value that is not excluded by a `ne` condition.
+    // A `None` interval length means the interval is too large to be exhausted by the finite
+    // number of exclusions.
+    if let Some(interval_len) = upper
+        .checked_sub(lower)
+        .and_then(|diff| diff.checked_add(1))
+    {
+        let excluded = ne_values
+            .iter()
+            .filter(|value| **value >= lower && **value <= upper)
+            .count() as u64;
+        if excluded >= interval_len {
+            return false;
+        }
+    }
+
+    // If the interval is a single point, it must also satisfy the bit constraints.
+    !(lower == upper
+        && masked_eqs
+            .iter()
+            .any(|(mask, masked_value)| lower & mask != *masked_value))
+}
 
 /// Rule that a filter attempts to match for a syscall.
 ///
@@ -54,6 +155,38 @@ impl SeccompRule {
         }
 
         Ok(())
+    }
+
+    /// Returns the canonical form of the rule's conditions: sorted and deduplicated.
+    ///
+    /// The conditions of a rule are and-bound, and conjunction is commutative and idempotent,
+    /// so two rules are provably equivalent if and only if their canonical forms are equal.
+    /// This equivalence is used by [`SeccompFilter`](super::SeccompFilter) to detect duplicate
+    /// rules at compile time.
+    pub(crate) fn canonical_conditions(&self) -> Vec<SeccompCondition> {
+        let mut conditions = self.conditions.clone();
+        conditions.sort();
+        conditions.dedup();
+        conditions
+    }
+
+    /// Checks whether the conditions of the rule can be simultaneously satisfied.
+    ///
+    /// Conditions on different syscall arguments are independent, so the rule is satisfiable
+    /// iff the constraints on each argument are. The check is sound but conservative: it only
+    /// reports definite contradictions between `eq`, `ne`, `ge`, `gt`, `le`, `lt` and
+    /// `masked_eq` conditions on the same argument.
+    pub(crate) fn is_satisfiable(&self) -> bool {
+        // Group the conditions by the argument (and argument length) they constrain.
+        let mut groups: BTreeMap<(u8, &SeccompCmpArgLen), Vec<&SeccompCondition>> = BTreeMap::new();
+        for condition in &self.conditions {
+            groups
+                .entry((condition.arg_index(), condition.arg_len()))
+                .or_default()
+                .push(condition);
+        }
+
+        groups.values().all(|group| constraints_satisfiable(group))
     }
 
     /// Appends a condition of the rule to an accumulator.
@@ -154,6 +287,110 @@ mod tests {
     #[test]
     fn test_validate_rule() {
         assert_eq!(SeccompRule::new(vec![]).unwrap_err(), Error::EmptyRule);
+    }
+
+    #[test]
+    fn test_canonical_conditions() {
+        // Conjunction is commutative and idempotent, so the canonical form is independent of
+        // condition order and duplication.
+        let rule = SeccompRule::new(vec![
+            Cond::new(2, ArgLen::Dword, Le, 14).unwrap(),
+            Cond::new(0, ArgLen::Qword, Eq, 1).unwrap(),
+            Cond::new(2, ArgLen::Dword, Le, 14).unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            rule.canonical_conditions(),
+            vec![
+                Cond::new(0, ArgLen::Qword, Eq, 1).unwrap(),
+                Cond::new(2, ArgLen::Dword, Le, 14).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_satisfiable() {
+        // Satisfiable rules.
+        for conditions in [
+            vec![Cond::new(0, ArgLen::Dword, Eq, 1).unwrap()],
+            vec![
+                Cond::new(0, ArgLen::Dword, Gt, 20).unwrap(),
+                Cond::new(0, ArgLen::Dword, Lt, 30).unwrap(),
+            ],
+            vec![
+                Cond::new(0, ArgLen::Dword, Ge, 20).unwrap(),
+                Cond::new(0, ArgLen::Dword, Le, 20).unwrap(),
+            ],
+            vec![
+                Cond::new(0, ArgLen::Dword, Eq, 10).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ne, 11).unwrap(),
+            ],
+            vec![
+                Cond::new(0, ArgLen::Dword, Ne, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ne, 2).unwrap(),
+            ],
+            vec![
+                Cond::new(0, ArgLen::Dword, MaskedEq(0b100), 36).unwrap(),
+                Cond::new(0, ArgLen::Dword, Eq, 36).unwrap(),
+            ],
+            // Conditions on different arguments are independent.
+            vec![
+                Cond::new(0, ArgLen::Dword, Eq, 1).unwrap(),
+                Cond::new(1, ArgLen::Dword, Eq, 2).unwrap(),
+            ],
+        ] {
+            assert!(SeccompRule::new(conditions).unwrap().is_satisfiable());
+        }
+
+        // Rules with mutually exclusive conditions.
+        for conditions in [
+            // Two different exact values.
+            vec![
+                Cond::new(0, ArgLen::Dword, Eq, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Eq, 2).unwrap(),
+            ],
+            // Exact value excluded by `ne`.
+            vec![
+                Cond::new(0, ArgLen::Dword, Eq, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ne, 1).unwrap(),
+            ],
+            // Exact value outside the interval.
+            vec![
+                Cond::new(0, ArgLen::Dword, Eq, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Gt, 1).unwrap(),
+            ],
+            // Empty interval.
+            vec![
+                Cond::new(0, ArgLen::Dword, Lt, 5).unwrap(),
+                Cond::new(0, ArgLen::Dword, Gt, 10).unwrap(),
+            ],
+            vec![
+                Cond::new(0, ArgLen::Dword, Le, 5).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ge, 6).unwrap(),
+            ],
+            vec![Cond::new(0, ArgLen::Dword, Lt, 0).unwrap()],
+            vec![Cond::new(0, ArgLen::Dword, Gt, u64::MAX).unwrap()],
+            // All points of the interval excluded by `ne` conditions.
+            vec![
+                Cond::new(0, ArgLen::Dword, Ge, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Le, 2).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ne, 1).unwrap(),
+                Cond::new(0, ArgLen::Dword, Ne, 2).unwrap(),
+            ],
+            // Conflicting bit constraints on overlapping masks.
+            vec![
+                Cond::new(0, ArgLen::Dword, MaskedEq(0b11), 0b01).unwrap(),
+                Cond::new(0, ArgLen::Dword, MaskedEq(0b10), 0b10).unwrap(),
+            ],
+            // Exact value violating a bit constraint.
+            vec![
+                Cond::new(0, ArgLen::Dword, MaskedEq(0b100), 0).unwrap(),
+                Cond::new(0, ArgLen::Dword, Eq, 0b100).unwrap(),
+            ],
+        ] {
+            assert!(!SeccompRule::new(conditions).unwrap().is_satisfiable());
+        }
     }
 
     // Checks that rule gets translated correctly into BPF statements.

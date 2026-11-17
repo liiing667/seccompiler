@@ -5,7 +5,7 @@ use super::{Error, Result, SeccompCmpArgLen, SeccompCmpOp};
 use crate::backend::bpf::*;
 
 /// Condition that a syscall must match in order to satisfy a rule.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeccompCondition {
     /// Index of the argument that is to be compared.
     arg_index: u8,
@@ -51,6 +51,27 @@ impl SeccompCondition {
 
         instance.validate().map(|_| Ok(instance))?
     }
+
+    /// Returns the index of the syscall argument that is compared.
+    pub(crate) fn arg_index(&self) -> u8 {
+        self.arg_index
+    }
+
+    /// Returns the length of the compared argument value.
+    pub(crate) fn arg_len(&self) -> &SeccompCmpArgLen {
+        &self.arg_len
+    }
+
+    /// Returns the comparison operator.
+    pub(crate) fn operator(&self) -> &SeccompCmpOp {
+        &self.operator
+    }
+
+    /// Returns the value the argument is compared against.
+    pub(crate) fn value(&self) -> u64 {
+        self.value
+    }
+
     /// Validates the `SeccompCondition` data.
     ///
     /// [`SeccompCondition`]: struct.SeccompCondition.html

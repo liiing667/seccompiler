@@ -35,6 +35,8 @@ type Result<T> = result::Result<T, Error>;
 pub enum Error {
     /// Backend error creating the `SeccompFilter` IR.
     Backend(BackendError),
+    /// A syscall has both an unconditional rule (no `args`) and conditional rules.
+    ConflictingRules(String),
     /// Error deserializing JSON.
     SerdeJson(serde_json::Error),
     /// Invalid syscall name for the given arch.
@@ -59,6 +61,12 @@ impl fmt::Display for Error {
 
         match self {
             Backend(error) => write!(f, "{}", error),
+            ConflictingRules(syscall_name) => write!(
+                f,
+                "Conflicting rules for syscall: {}. A syscall cannot have both an unconditional \
+                 rule (no `args`) and conditional rules.",
+                syscall_name
+            ),
             SerdeJson(error) => {
                 write!(f, "Error parsing Json: {}", error)
             }
@@ -230,6 +238,9 @@ impl JsonCompiler {
     /// Transforms the deserialized `JsonFilter` into a `SeccompFilter` (IR language).
     fn make_seccomp_filter(&self, filter: JsonFilter) -> Result<SeccompFilter> {
         let mut rule_map: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        // Syscalls for which an unconditional rule (a rule without `args`) was specified.
+        let mut unconditional_syscalls: std::collections::BTreeSet<i64> =
+            std::collections::BTreeSet::new();
 
         for json_rule in filter.rules {
             let syscall_name = json_rule.syscall;
@@ -239,13 +250,34 @@ impl JsonCompiler {
                 .ok_or_else(|| Error::SyscallName(syscall_name.clone(), self.arch))?;
             let rule_accumulator = rule_map.entry(syscall_nr).or_default();
 
-            if let Some(conditions) = json_rule.conditions {
-                let mut seccomp_conditions = Vec::with_capacity(conditions.len());
-                for condition in conditions {
-                    seccomp_conditions.push(condition.try_into()?);
+            match json_rule.conditions {
+                Some(conditions) => {
+                    // Conflict priority: an unconditional rule matches any argument values, so
+                    // it subsumes (has priority over) every conditional rule of the same
+                    // syscall, making the conditional rules provably dead. Silently dropping
+                    // them would mask the author's intent, while falling back to the
+                    // unconditional match when all conditions fail would violate the principle
+                    // of least privilege. The ambiguous combination is therefore rejected.
+                    if unconditional_syscalls.contains(&syscall_nr) {
+                        return Err(Error::ConflictingRules(syscall_name));
+                    }
+                    let mut seccomp_conditions = Vec::with_capacity(conditions.len());
+                    for condition in conditions {
+                        seccomp_conditions.push(condition.try_into()?);
+                    }
+                    rule_accumulator
+                        .push(SeccompRule::new(seccomp_conditions).map_err(Error::Backend)?);
                 }
-                rule_accumulator
-                    .push(SeccompRule::new(seccomp_conditions).map_err(Error::Backend)?);
+                None => {
+                    // An unconditional rule. It is only valid if it is the single rule of the
+                    // syscall: see the conflict priority above.
+                    if !rule_accumulator.is_empty() {
+                        return Err(Error::ConflictingRules(syscall_name));
+                    }
+                    if !unconditional_syscalls.insert(syscall_nr) {
+                        return Err(Error::Backend(BackendError::DuplicateRule(syscall_nr)));
+                    }
+                }
             }
         }
 
@@ -447,6 +479,166 @@ mod tests {
             compiler.make_seccomp_filter(filter).unwrap(),
             seccomp_filter
         );
+    }
+
+    #[test]
+    // Acceptance matrix for the combinations of unconditional (U) and conditional (C) rules
+    // that a single syscall can have in a JSON filter.
+    //
+    // Semantics under test:
+    // * multiple conditional rules of a syscall are or-bound (unchanged);
+    // * a single unconditional rule matches any argument values (unchanged);
+    // * an unconditional rule subsumes conditional rules of the same syscall, so the
+    //   combination is rejected as conflicting instead of silently masking intent;
+    // * rules equivalent up to condition order/duplication are duplicates;
+    // * rules with mutually exclusive conditions can never match;
+    // * rules with an empty condition vector are not allowed.
+    fn test_rule_combination_matrix() {
+        let compiler = JsonCompiler::new(ARCH.try_into().unwrap());
+        let read_nr = compiler.syscall_table.get_syscall_nr("read").unwrap();
+
+        let cond_a = || JsonCondition::new(0, Dword, Eq, 1);
+        let cond_b = || JsonCondition::new(0, Dword, Ge, 1);
+        let unconditional = || JsonRule::new("read".to_string(), None);
+        let conditional =
+            |conditions: Vec<JsonCondition>| JsonRule::new("read".to_string(), Some(conditions));
+        let compile = |rules: Vec<JsonRule>| {
+            compiler.make_seccomp_filter(JsonFilter::new(
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                rules,
+            ))
+        };
+
+        // No rules: the syscall is not matched at all.
+        assert_eq!(
+            compile(vec![]).unwrap(),
+            SeccompFilter::new(
+                std::collections::BTreeMap::new(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                ARCH.try_into().unwrap(),
+            )
+            .unwrap()
+        );
+
+        // {U}: single unconditional rule, matches any argument values.
+        assert_eq!(
+            compile(vec![unconditional()]).unwrap(),
+            SeccompFilter::new(
+                vec![(read_nr, vec![])].into_iter().collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                ARCH.try_into().unwrap(),
+            )
+            .unwrap()
+        );
+
+        // {C}: single conditional rule.
+        assert!(compile(vec![conditional(vec![cond_a()])]).is_ok());
+
+        // {C, C'}: distinct conditional rules are or-bound.
+        assert!(compile(vec![
+            conditional(vec![cond_a()]),
+            conditional(vec![cond_b()]),
+        ])
+        .is_ok());
+
+        // {C, C}: identical rules are duplicates.
+        assert!(matches!(
+            compile(vec![conditional(vec![cond_a()]), conditional(vec![cond_a()])]).unwrap_err(),
+            Error::Backend(BackendError::DuplicateRule(nr)) if nr == read_nr
+        ));
+
+        // {C(a,b), C(b,a)}: rules equivalent up to condition order and duplication are
+        // duplicates (provable rule equivalence).
+        assert!(matches!(
+            compile(vec![
+                conditional(vec![cond_a(), cond_b()]),
+                conditional(vec![cond_b(), cond_a(), cond_b()]),
+            ])
+            .unwrap_err(),
+            Error::Backend(BackendError::DuplicateRule(nr)) if nr == read_nr
+        ));
+
+        // {U, U}: repeated unconditional rules are duplicates.
+        assert!(matches!(
+            compile(vec![unconditional(), unconditional()]).unwrap_err(),
+            Error::Backend(BackendError::DuplicateRule(nr)) if nr == read_nr
+        ));
+
+        // {U, C} and {C, U}: an unconditional rule cannot be combined with conditional rules,
+        // in any order.
+        assert!(matches!(
+            compile(vec![unconditional(), conditional(vec![cond_a()])]).unwrap_err(),
+            Error::ConflictingRules(syscall) if syscall == "read"
+        ));
+        assert!(matches!(
+            compile(vec![conditional(vec![cond_a()]), unconditional()]).unwrap_err(),
+            Error::ConflictingRules(syscall) if syscall == "read"
+        ));
+
+        // {C(empty)}: rules with an empty condition vector are not allowed.
+        assert!(matches!(
+            compile(vec![conditional(vec![])]).unwrap_err(),
+            Error::Backend(BackendError::EmptyRule)
+        ));
+
+        // Rules with mutually exclusive conditions can never match.
+        for contradictory in [
+            // eq with two different values.
+            vec![
+                JsonCondition::new(0, Dword, Eq, 1),
+                JsonCondition::new(0, Dword, Eq, 2),
+            ],
+            // eq excluded by ne.
+            vec![
+                JsonCondition::new(0, Dword, Eq, 1),
+                JsonCondition::new(0, Dword, Ne, 1),
+            ],
+            // empty interval.
+            vec![
+                JsonCondition::new(0, Dword, Lt, 5),
+                JsonCondition::new(0, Dword, Gt, 10),
+            ],
+            // conflicting masked_eq bit constraints.
+            vec![
+                JsonCondition::new(0, Dword, MaskedEq(0b11), 0b01),
+                JsonCondition::new(0, Dword, MaskedEq(0b10), 0b10),
+            ],
+        ] {
+            assert!(matches!(
+                compile(vec![conditional(contradictory)]).unwrap_err(),
+                Error::Backend(BackendError::ContradictoryRule(nr)) if nr == read_nr
+            ));
+        }
+
+        // {C, C(contradictory)}: a contradictory rule is rejected even when or-ed with a
+        // satisfiable one.
+        assert!(matches!(
+            compile(vec![
+                conditional(vec![cond_a()]),
+                conditional(vec![
+                    JsonCondition::new(0, Dword, Eq, 1),
+                    JsonCondition::new(0, Dword, Eq, 2),
+                ]),
+            ])
+            .unwrap_err(),
+            Error::Backend(BackendError::ContradictoryRule(nr)) if nr == read_nr
+        ));
+
+        // {U(syscall_1), C(syscall_2)}: unconditional and conditional rules of different
+        // syscalls do not conflict.
+        assert!(compiler
+            .make_seccomp_filter(JsonFilter::new(
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                vec![
+                    unconditional(),
+                    JsonRule::new("futex".to_string(), Some(vec![cond_a()])),
+                ],
+            ))
+            .is_ok());
     }
 
     #[allow(clippy::useless_asref)]

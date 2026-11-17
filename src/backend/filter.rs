@@ -8,6 +8,12 @@ use crate::backend::rule::SeccompRule;
 use crate::backend::{Error, Result, SeccompAction, TargetArch};
 
 /// Filter containing rules assigned to syscall numbers.
+///
+/// The rules of a syscall are or-bound. The filter is validated at construction time:
+/// rules that are provably equivalent (see [`SeccompRule`]) are rejected as duplicates, and
+/// rules whose conditions can never be simultaneously satisfied are rejected as contradictory.
+///
+/// [`SeccompRule`]: struct.SeccompRule.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeccompFilter {
     /// Map of syscall numbers and corresponding rule chains.
@@ -105,6 +111,25 @@ impl SeccompFilter {
         // Doesn't make sense to have equal default and on-match actions.
         if self.mismatch_action == self.match_action {
             return Err(Error::IdenticalActions);
+        }
+
+        // Check the rule chain of each syscall for rules that are provably redundant or can
+        // never match.
+        for (syscall_number, chain) in &self.rules {
+            let mut canonical_forms = std::collections::HashSet::new();
+            for rule in chain {
+                // A rule with mutually exclusive conditions can never match, so it is dead
+                // code that hides the effective behavior of the filter.
+                if !rule.is_satisfiable() {
+                    return Err(Error::ContradictoryRule(*syscall_number));
+                }
+                // Two rules are provably equivalent iff their canonical condition sets are
+                // equal (conjunction is commutative and idempotent). Equivalent rules in an
+                // or-bound chain are redundant and most likely a configuration mistake.
+                if !canonical_forms.insert(rule.canonical_conditions()) {
+                    return Err(Error::DuplicateRule(*syscall_number));
+                }
+            }
         }
 
         Ok(())
@@ -289,12 +314,64 @@ mod tests {
             .unwrap_err(),
             Error::IdenticalActions
         );
+
+        // Filter with two equivalent rules for the same syscall (the condition order and
+        // duplication of conditions do not matter, since conjunction is commutative and
+        // idempotent).
+        assert_eq!(
+            SeccompFilter::new(
+                vec![(
+                    1,
+                    vec![
+                        SeccompRule::new(vec![
+                            Cond::new(2, ArgLen::Dword, Le, 14).unwrap(),
+                            Cond::new(2, ArgLen::Dword, Ne, 10).unwrap(),
+                        ])
+                        .unwrap(),
+                        SeccompRule::new(vec![
+                            Cond::new(2, ArgLen::Dword, Ne, 10).unwrap(),
+                            Cond::new(2, ArgLen::Dword, Le, 14).unwrap(),
+                            Cond::new(2, ArgLen::Dword, Ne, 10).unwrap(),
+                        ])
+                        .unwrap(),
+                    ],
+                )]
+                .into_iter()
+                .collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                ARCH.try_into().unwrap()
+            )
+            .unwrap_err(),
+            Error::DuplicateRule(1)
+        );
+
+        // Filter with a rule that contains mutually exclusive conditions.
+        assert_eq!(
+            SeccompFilter::new(
+                vec![(
+                    1,
+                    vec![SeccompRule::new(vec![
+                        Cond::new(2, ArgLen::Dword, Eq, 14).unwrap(),
+                        Cond::new(2, ArgLen::Dword, Ne, 14).unwrap(),
+                    ])
+                    .unwrap()],
+                )]
+                .into_iter()
+                .collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                ARCH.try_into().unwrap()
+            )
+            .unwrap_err(),
+            Error::ContradictoryRule(1)
+        );
     }
 
     #[test]
     fn test_seccomp_filter_too_large() {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-        for _ in 1..1000 {
+        for value in 1..1000 {
             rules
                 .entry(1)
                 .or_default()
@@ -302,7 +379,7 @@ mod tests {
                     2,
                     ArgLen::Dword,
                     Le,
-                    14,
+                    value,
                 )
                 .unwrap()])
                 .unwrap()]);

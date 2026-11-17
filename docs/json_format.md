@@ -73,6 +73,36 @@ In order to allow a syscall with multiple alternatives for the same parameters,
 one can write multiple syscall rule objects at the filter-level, each with its
 own, distinct rules.
 
+## Rule combination semantics
+
+The rules of a syscall are **or-bound**, and the conditions of a rule are
+**and-bound**. The following conflicts are detected at compile time, instead of
+being silently resolved in an order-dependent way:
+
+- **Unconditional vs. conditional rules**: an unconditional rule (no `args`)
+  matches any argument values, so it subsumes every conditional rule of the
+  same syscall (formally, `true OR P` is `true` for any condition `P`), making
+  the conditional rules provably dead. Silently dropping them would mask the
+  author's intent, while falling back to the unconditional match when all
+  conditions fail would violate the principle of least privilege. The
+  combination is therefore rejected with a `ConflictingRules` error, in either
+  order. An unconditional rule is only valid as the single rule of its
+  syscall.
+- **Duplicate rules**: two rules are provably equivalent if and only if their
+  condition sets are equal, because conjunction is commutative and idempotent
+  (condition order and repeated conditions do not change the meaning of a
+  rule). Equivalent rules of the same syscall are redundant and are rejected
+  with a `DuplicateRule` error. This also covers repeated unconditional rules
+  of a syscall.
+- **Empty conditions**: a rule with an empty `args` vector is rejected with an
+  `EmptyRule` error. To match a syscall regardless of argument values, use a
+  rule without the `args` property.
+- **Mutually exclusive conditions**: a rule whose conditions can never be
+  simultaneously satisfied (e.g. `eq 1` and `eq 2` on the same argument, an
+  empty `ge`/`le` interval, an `eq` value excluded by `ne`, or `masked_eq`
+  constraints that disagree on overlapping mask bits) can never match and is
+  rejected with a `ContradictoryRule` error.
+
 A **condition object** is made up of the following mandatory properties:
 
 - `index` (0-based index of the syscall argument we want to check)

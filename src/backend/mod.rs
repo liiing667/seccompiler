@@ -36,6 +36,12 @@ type Result<T> = std::result::Result<T, Error>;
 /// Backend-related errors.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
+    /// A rule contains conditions that can never be simultaneously satisfied, making the rule
+    /// impossible to match (e.g. `arg0 == 1` and `arg0 == 2`).
+    ContradictoryRule(i64),
+    /// Two rules of the same syscall are equivalent, i.e. their condition sets are equal up to
+    /// ordering and duplication of conditions (conjunction is commutative and idempotent).
+    DuplicateRule(i64),
     /// Attempting to associate an empty vector of conditions to a rule.
     EmptyRule,
     /// Filter exceeds the maximum number of instructions that a BPF program can have.
@@ -55,6 +61,21 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
+            ContradictoryRule(syscall_nr) => {
+                write!(
+                    f,
+                    "A rule of syscall {} contains mutually exclusive conditions and can never \
+                     match.",
+                    syscall_nr
+                )
+            }
+            DuplicateRule(syscall_nr) => {
+                write!(
+                    f,
+                    "The rules of syscall {} contain a duplicate (two equivalent rules).",
+                    syscall_nr
+                )
+            }
             EmptyRule => {
                 write!(f, "The condition vector of a rule cannot be empty.")
             }
@@ -117,7 +138,7 @@ impl TryFrom<&str> for TargetArch {
     derive(Deserialize),
     serde(rename_all = "snake_case")
 )]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SeccompCmpOp {
     /// Argument value is equal to the specified value.
     Eq,
@@ -137,7 +158,7 @@ pub enum SeccompCmpOp {
 
 /// Seccomp argument value length.
 #[cfg_attr(feature = "json", derive(Deserialize), serde(rename_all = "lowercase"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SeccompCmpArgLen {
     /// Argument value length is 4 bytes.
     Dword,
