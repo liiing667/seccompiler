@@ -111,6 +111,15 @@ impl TryFrom<&str> for TargetArch {
     }
 }
 
+impl std::str::FromStr for TargetArch {
+    type Err = Error;
+
+    /// Parses a target architecture name, failing closed on unknown names.
+    fn from_str(input: &str) -> Result<Self> {
+        Self::try_from(input)
+    }
+}
+
 /// Comparison to perform when matching a condition.
 #[cfg_attr(
     feature = "json",
@@ -222,5 +231,28 @@ mod tests {
             TargetArch::try_from("RiScV64").unwrap(),
             TargetArch::riscv64
         );
+    }
+
+    #[test]
+    fn test_target_arch_from_str() {
+        use std::str::FromStr;
+
+        // Unknown or conflicting architecture names fail closed.
+        assert!(TargetArch::from_str("invalid").is_err());
+        assert!(TargetArch::from_str("x86").is_err());
+        assert!(TargetArch::from_str("amd64").is_err());
+        assert!(TargetArch::from_str("riscv").is_err());
+        assert!(TargetArch::from_str("").is_err());
+
+        assert_eq!(TargetArch::from_str("x86_64").unwrap(), TargetArch::x86_64);
+        assert_eq!(
+            TargetArch::from_str("aarch64").unwrap(),
+            TargetArch::aarch64
+        );
+        assert_eq!(
+            TargetArch::from_str("riscv64").unwrap(),
+            TargetArch::riscv64
+        );
+        assert_eq!("x86_64".parse::<TargetArch>().unwrap(), TargetArch::x86_64);
     }
 }

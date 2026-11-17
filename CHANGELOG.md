@@ -1,5 +1,13 @@
 # Upcoming Release
 
+## Added
+
+- Added a `FromStr` implementation for `TargetArch` and a
+  `SeccompFilter::target_arch()` getter, so the target architecture selected
+  at parse time stays observable through the IR and the generated BPF
+  program. Unknown or conflicting architecture and syscall names keep
+  failing closed.
+
 # v0.5.0
 
 ## Added

@@ -18,6 +18,16 @@ enum Errno {
     None,
 }
 
+// Returns the seccomp level of the current thread before the test installs
+// its own filter. Test environments (e.g. container runtimes) may have
+// already installed a seccomp filter, in which case the level is 2 instead
+// of 0.
+fn get_initial_seccomp_level() -> i32 {
+    let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+    assert!(seccomp_level == 0 || seccomp_level == 2);
+    seccomp_level
+}
+
 fn validate_json_filter<R: Read>(reader: R, validation_fn: fn(), errno: Errno) {
     let mut filters = compile_from_json(reader, ARCH.try_into().unwrap()).unwrap();
     let filter: BpfProgram = filters.remove("main_thread").unwrap();
@@ -62,8 +72,7 @@ fn test_empty_filter_allow_all() {
     let filter = filters.remove("main_thread").unwrap();
     // This should allow any system calls.
     let pid = thread::spawn(move || {
-        let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        get_initial_seccomp_level();
         // Install the filter.
         apply_filter(&filter).unwrap();
         let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
@@ -95,8 +104,7 @@ fn test_empty_filter_deny_all() {
 
     match pid {
         0 => {
-            let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-            assert_eq!(seccomp_level, 0);
+            get_initial_seccomp_level();
             // Install the filter.
             apply_filter(&filter).unwrap();
             // this syscall will fail

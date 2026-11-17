@@ -45,6 +45,16 @@ enum Errno {
     None,
 }
 
+// Returns the seccomp level of the current thread before the test installs
+// its own filter. Test environments (e.g. container runtimes) may have
+// already installed a seccomp filter, in which case the level is 2 instead
+// of 0.
+fn get_initial_seccomp_level() -> i32 {
+    let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+    assert!(seccomp_level == 0 || seccomp_level == 2);
+    seccomp_level
+}
+
 fn validate_seccomp_filter(rules: Vec<(i64, Vec<SeccompRule>)>, validation_fn: fn(), errno: Errno) {
     let mut rule_map: BTreeMap<i64, Vec<SeccompRule>> = rules.into_iter().collect();
 
@@ -103,8 +113,7 @@ fn test_empty_filter() {
 
     // This should allow any system calls.
     let pid = thread::spawn(move || {
-        let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        get_initial_seccomp_level();
         // Install the filter.
         apply_filter(&prog).unwrap();
 
@@ -726,17 +735,16 @@ fn test_filter_apply() {
 
         assert_eq!(filter.len(), 0);
 
-        let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        let initial_level = get_initial_seccomp_level();
 
         assert!(matches!(
             apply_filter(&filter).unwrap_err(),
             Error::EmptyFilter
         ));
 
-        // test that seccomp level remains 0 on failure.
+        // test that seccomp level remains unchanged on failure.
         let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        assert_eq!(seccomp_level, initial_level);
     })
     .join()
     .unwrap();
@@ -751,17 +759,16 @@ fn test_filter_apply() {
             k: 0,
         }];
 
-        let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        let initial_level = get_initial_seccomp_level();
 
         assert!(matches!(
             apply_filter(&filter).unwrap_err(),
             Error::Seccomp(_)
         ));
 
-        // test that seccomp level remains 0 on failure.
+        // test that seccomp level remains unchanged on failure.
         let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        assert_eq!(seccomp_level, initial_level);
     })
     .join()
     .unwrap();
@@ -777,8 +784,7 @@ fn test_filter_apply() {
         .unwrap();
         let prog: BpfProgram = filter.try_into().unwrap();
 
-        let seccomp_level = unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
-        assert_eq!(seccomp_level, 0);
+        get_initial_seccomp_level();
 
         apply_filter(&prog).unwrap();
 

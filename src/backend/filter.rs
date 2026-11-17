@@ -100,6 +100,15 @@ impl SeccompFilter {
         Ok(instance)
     }
 
+    /// Returns the target architecture of the filter.
+    ///
+    /// This is the architecture that was used for resolving syscall names to
+    /// numbers and whose audit value is embedded in the architecture
+    /// validation sequence of the compiled BPF program.
+    pub fn target_arch(&self) -> TargetArch {
+        self.target_arch
+    }
+
     /// Performs semantic checks on the SeccompFilter.
     fn validate(&self) -> Result<()> {
         // Doesn't make sense to have equal default and on-match actions.
@@ -336,6 +345,10 @@ mod tests {
             ARCH.try_into().unwrap(),
         )
         .unwrap();
+
+        // The filter keeps the identity of the architecture it was compiled for.
+        assert_eq!(filter.target_arch(), ARCH.try_into().unwrap());
+
         let prog: BpfProgram = filter.try_into().unwrap();
 
         assert_eq!(expected_program, prog);

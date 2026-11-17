@@ -4,6 +4,14 @@ A JSON file expresses the seccomp policy for a process. It may contain multiple
 filters, which can be semantically mapped to thread types in multithreaded
 applications, and is specific to just one target platform of the application.
 
+The target architecture is selected by the caller at compilation time (see
+`compile_from_json`) and applies to every filter in the file: syscall names
+are resolved using the selected architecture's syscall table, and each
+generated BPF program starts with a validation sequence that kills the
+process if the runtime architecture does not match the selected one. Syscall
+names that are unknown for the selected architecture, as well as conflicting
+or duplicate fields, are rejected with an error (fail closed).
+
 At the top level, the file requires an object that maps unique string keys to
 seccomp filters:
 
