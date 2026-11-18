@@ -1,5 +1,20 @@
 # Upcoming Release
 
+## Changed
+- BPF code generation now happens in two phases: a layout phase first proves that every
+  jump target is reachable and encodable (conditional offsets fit in a `u8`) and that the
+  whole program fits within the 4096-instruction kernel budget, and only then is the final
+  program emitted in a single pass. All jump arithmetic is performed in `usize`, removing
+  the possibility of a silent `u8` offset wrap-around. Boundary errors now carry a
+  `CodegenLocation` identifying the exact rule, condition or prologue responsible. Bytecode
+  emitted for ordinary short policies is unchanged.
+
+## Added
+- `Error::JumpOutOfRange`, reported with the instruction index, the offending offset and a
+  `CodegenLocation`, when a laid-out jump cannot be encoded or escapes the program.
+- `Error::FilterTooLarge` now additionally reports the `CodegenLocation` of the block that
+  exceeds the BPF length budget.
+
 # v0.5.0
 
 ## Added

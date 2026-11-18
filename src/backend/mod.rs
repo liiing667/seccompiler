@@ -39,13 +39,78 @@ pub enum Error {
     /// Attempting to associate an empty vector of conditions to a rule.
     EmptyRule,
     /// Filter exceeds the maximum number of instructions that a BPF program can have.
-    FilterTooLarge(usize),
+    ///
+    /// `length` is the total length of the laid-out program and `location` identifies the part of
+    /// the filter whose instructions pushed the program over the [`BPF_MAX_LEN`] budget.
+    FilterTooLarge {
+        /// Total length, in BPF instructions, of the laid-out program.
+        length: usize,
+        /// Part of the filter that caused the budget to be exceeded.
+        location: CodegenLocation,
+    },
     /// Filter and default actions are equal.
     IdenticalActions,
     /// Argument index of a `SeccompCondition` exceeds the maximum linux syscall index.
     InvalidArgumentNumber,
     /// Invalid TargetArch.
     InvalidTargetArch(String),
+    /// A jump offset cannot be encoded or does not point inside the program.
+    ///
+    /// Conditional jump offsets must fit in a `u8` and every jump target must stay within the
+    /// program. `offset` is the offending offset, `index` the position of the jump instruction in
+    /// the laid-out program and `location` the part of the filter the jump belongs to.
+    JumpOutOfRange {
+        /// Offending relative jump offset, in BPF instructions.
+        offset: usize,
+        /// Index of the jump instruction in the laid-out program.
+        index: usize,
+        /// Part of the filter that produced the jump.
+        location: CodegenLocation,
+    },
+}
+
+/// Position of a piece of generated BPF code within the logical structure of a filter.
+///
+/// Every error reported by the layout phase carries one of these locations so that the rule,
+/// syscall chain or fixed prologue/epilogue responsible for a boundary violation can be
+/// identified without reproducing the whole program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodegenLocation {
+    /// Fixed architecture validation prologue.
+    ArchValidation,
+    /// Instruction loading the syscall number.
+    SyscallNumberLoad,
+    /// Syscall number comparison of a rule chain. Holds the syscall number.
+    SyscallChain(i64),
+    /// Rule entry/exit jumps. Holds the syscall number and the index of the rule in its chain.
+    Rule {
+        /// Syscall number the rule belongs to. `None` when a rule is compiled on its own.
+        syscall: Option<i64>,
+        /// Zero-based index of the rule within the syscall chain.
+        rule_index: usize,
+    },
+    /// Condition of a rule. Holds the syscall number, the rule index and the condition index.
+    Condition {
+        /// Syscall number the rule belongs to. `None` when a rule is compiled on its own.
+        syscall: Option<i64>,
+        /// Zero-based index of the rule within the syscall chain.
+        rule_index: usize,
+        /// Zero-based index of the condition within the rule.
+        condition_index: usize,
+    },
+    /// Helper jumps inserted to bridge jumps longer than a `u8` offset.
+    HelperJump {
+        /// Syscall number the rule belongs to. `None` when a rule is compiled on its own.
+        syscall: Option<i64>,
+        /// Zero-based index of the rule within the syscall chain.
+        rule_index: usize,
+    },
+    /// Return action of a matched rule.
+    MatchReturn(i64),
+    /// Default action reached when a syscall number matches but no rule does.
+    ChainMismatchReturn(i64),
+    /// Final default action reached when no syscall number matches.
+    DefaultReturn,
 }
 
 impl std::error::Error for Error {}
@@ -58,10 +123,11 @@ impl Display for Error {
             EmptyRule => {
                 write!(f, "The condition vector of a rule cannot be empty.")
             }
-            FilterTooLarge(len) => write!(
+            FilterTooLarge { length, location } => write!(
                 f,
-                "The seccomp filter contains too many BPF instructions: {}. Max length is {}.",
-                len, BPF_MAX_LEN
+                "The seccomp filter contains too many BPF instructions: {} (max {}). The budget \
+                 was exceeded while generating {}.",
+                length, BPF_MAX_LEN, location
             ),
             IdenticalActions => write!(f, "`match_action` and `mismatch_action` are equal."),
             InvalidArgumentNumber => {
@@ -72,6 +138,71 @@ impl Display for Error {
                 )
             }
             InvalidTargetArch(arch) => write!(f, "Invalid target arch: {}.", arch),
+            JumpOutOfRange {
+                offset,
+                index,
+                location,
+            } => write!(
+                f,
+                "BPF jump at instruction {} cannot be encoded with the offset {} (conditional \
+                 jumps are limited to a u8 range and targets must stay inside the program), \
+                 while generating {}.",
+                index, offset, location
+            ),
+        }
+    }
+}
+
+impl Display for CodegenLocation {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            CodegenLocation::ArchValidation => write!(f, "the architecture validation prologue"),
+            CodegenLocation::SyscallNumberLoad => write!(f, "the syscall number load"),
+            CodegenLocation::SyscallChain(syscall) => {
+                write!(f, "the rule chain of syscall {}", syscall)
+            }
+            CodegenLocation::Rule {
+                syscall,
+                rule_index,
+            } => write!(
+                f,
+                "rule {}{}",
+                rule_index,
+                syscall
+                    .map(|syscall| format!(" of syscall {}", syscall))
+                    .unwrap_or_default()
+            ),
+            CodegenLocation::Condition {
+                syscall,
+                rule_index,
+                condition_index,
+            } => write!(
+                f,
+                "condition {} of rule {}{}",
+                condition_index,
+                rule_index,
+                syscall
+                    .map(|syscall| format!(" of syscall {}", syscall))
+                    .unwrap_or_default()
+            ),
+            CodegenLocation::HelperJump {
+                syscall,
+                rule_index,
+            } => write!(
+                f,
+                "a helper jump of rule {}{}",
+                rule_index,
+                syscall
+                    .map(|syscall| format!(" of syscall {}", syscall))
+                    .unwrap_or_default()
+            ),
+            CodegenLocation::MatchReturn(syscall) => {
+                write!(f, "the match action of syscall {}", syscall)
+            }
+            CodegenLocation::ChainMismatchReturn(syscall) => {
+                write!(f, "the mismatch action of syscall {}", syscall)
+            }
+            CodegenLocation::DefaultReturn => write!(f, "the final default action"),
         }
     }
 }

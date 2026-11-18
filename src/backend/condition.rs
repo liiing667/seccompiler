@@ -90,21 +90,21 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_eq_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_eq_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, 0, offset),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, 0, offset),
         ]);
         bpf
     }
@@ -114,21 +114,21 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_ne_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_ne_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, offset, 0),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, offset, 0),
         ]);
         bpf
     }
@@ -138,22 +138,22 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_ge_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_ge_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JGT | BPF_K, msb, 3, 0),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, msb, 3, 0),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JGE | BPF_K, lsb, 0, offset),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JGE | BPF_K, lsb, 0, offset),
         ]);
         bpf
     }
@@ -163,22 +163,22 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_gt_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_gt_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JGT | BPF_K, msb, 3, 0),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, msb, 3, 0),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JGT | BPF_K, lsb, 0, offset),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, lsb, 0, offset),
         ]);
         bpf
     }
@@ -188,22 +188,22 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_le_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_le_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JGT | BPF_K, msb, offset + 3, 0),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, msb, offset + 3, 0),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JGT | BPF_K, lsb, offset, 0),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, lsb, offset, 0),
         ]);
         bpf
     }
@@ -213,22 +213,22 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_lt_bpf(self, offset: u8) -> Vec<sock_filter> {
+    fn into_lt_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let (msb, lsb) = self.split_value();
         let (msb_offset, lsb_offset) = self.get_data_offsets();
 
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_jump(BPF_JMP | BPF_JGT | BPF_K, msb, offset + 3, 0),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_cond_jump(BPF_JMP | BPF_JGT | BPF_K, msb, offset + 3, 0),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, 2),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_jump(BPF_JMP | BPF_JGE | BPF_K, lsb, offset, 0),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_cond_jump(BPF_JMP | BPF_JGE | BPF_K, lsb, offset, 0),
         ]);
         bpf
     }
@@ -241,7 +241,7 @@ impl SeccompCondition {
     /// # Arguments
     ///
     /// * `offset` - The given jump offset to the start of the next rule.
-    fn into_masked_eq_bpf(mut self, offset: u8, mask: u64) -> Vec<sock_filter> {
+    fn into_masked_eq_bpf(mut self, offset: usize, mask: u64) -> Vec<PlannedInstruction> {
         // Mask the current value.
         self.value &= mask;
 
@@ -252,16 +252,16 @@ impl SeccompCondition {
         let mut bpf = match self.arg_len {
             SeccompCmpArgLen::Dword => vec![],
             SeccompCmpArgLen::Qword => vec![
-                bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
-                bpf_stmt(BPF_ALU | BPF_AND | BPF_K, mask_msb),
-                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 3),
+                planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(msb_offset)),
+                planned_stmt(BPF_ALU | BPF_AND | BPF_K, mask_msb),
+                planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, msb, 0, offset + 3),
             ],
         };
 
         bpf.append(&mut vec![
-            bpf_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
-            bpf_stmt(BPF_ALU | BPF_AND | BPF_K, mask_lsb),
-            bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, 0, offset),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, u32::from(lsb_offset)),
+            planned_stmt(BPF_ALU | BPF_AND | BPF_K, mask_lsb),
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, lsb, 0, offset),
         ]);
         bpf
     }
@@ -280,7 +280,7 @@ impl SeccompCondition {
     ///
     /// The most significant and least significant halves of the argument value are compared
     /// separately since the BPF operand and accumulator are 4 bytes whereas an argument value is 8.
-    pub(crate) fn into_bpf(self, offset: u8) -> Vec<sock_filter> {
+    pub(crate) fn into_bpf(self, offset: usize) -> Vec<PlannedInstruction> {
         let result = match self.operator {
             SeccompCmpOp::Eq => self.into_eq_bpf(offset),
             SeccompCmpOp::Ge => self.into_ge_bpf(offset),
@@ -292,7 +292,7 @@ impl SeccompCondition {
         };
 
         // Verifies that the `CONDITION_MAX_LEN` constant was properly updated.
-        assert!(result.len() <= CONDITION_MAX_LEN as usize);
+        assert!(result.len() <= usize::from(CONDITION_MAX_LEN));
 
         result
     }

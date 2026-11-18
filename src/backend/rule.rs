@@ -1,7 +1,9 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-use crate::backend::{bpf::*, condition::SeccompCondition, Error, Result};
+use crate::backend::bpf::*;
+use crate::backend::condition::SeccompCondition;
+use crate::backend::{CodegenLocation, Error, Result};
 
 /// Rule that a filter attempts to match for a syscall.
 ///
@@ -56,27 +58,27 @@ impl SeccompRule {
         Ok(())
     }
 
-    /// Appends a condition of the rule to an accumulator.
+    /// Lays out a condition of the rule into an accumulator of planned instructions.
     ///
-    /// The length of the rule and offset to the next rule are updated.
+    /// The length of the rule and the `usize` offset to the next rule are updated.
     ///
     /// # Arguments
     ///
     /// * `condition` - The condition added to the rule.
-    /// * `accumulator` - Accumulator of BPF statements that compose the BPF program.
-    /// * `rule_len` - Number of conditions in the rule.
+    /// * `location` - Location identifying the condition being generated.
+    /// * `accumulator` - Accumulator of planned BPF statements, built in reverse order.
     /// * `offset` - Offset (in number of BPF statements) to the next rule.
-    fn append_condition(
+    pub(crate) fn layout_condition(
         condition: SeccompCondition,
-        accumulator: &mut Vec<Vec<sock_filter>>,
-        offset: &mut u8,
+        location: &CodegenLocation,
+        accumulator: &mut Vec<(CodegenLocation, Vec<PlannedInstruction>)>,
+        offset: &mut usize,
     ) {
-        // Tries to detect whether prepending the current condition will produce an unjumpable
-        // offset (since BPF conditional jumps are a maximum of 255 instructions, which is
-        // u8::MAX).
-        if offset.checked_add(CONDITION_MAX_LEN + 1).is_none() {
-            // If that is the case, three additional helper jumps are prepended and the offset
-            // is reset to 1.
+        // Detects whether prepending the current condition would produce an offset that cannot be
+        // encoded once it is narrowed to a `u8` (BPF conditional jumps span at most 255
+        // instructions). The check uses `usize` arithmetic, so it can never wrap.
+        if offset.saturating_add(usize::from(CONDITION_MAX_LEN) + 1) > u8::MAX as usize {
+            // Three helper jumps are prepended and the offset is reset to 1.
             //
             // - The first jump continues the evaluation of the condition chain by jumping to
             //   the next condition or the action of the rule if the last condition was matched.
@@ -85,61 +87,117 @@ impl SeccompRule {
             // - The third jumps out of the rule chain of the syscall, to the rule chain of the
             //   next syscall number to be checked or the default action of the filter in the
             //   case of the last rule chain.
+            let helper_location = match location {
+                CodegenLocation::Rule {
+                    syscall,
+                    rule_index,
+                }
+                | CodegenLocation::Condition {
+                    syscall,
+                    rule_index,
+                    ..
+                } => CodegenLocation::HelperJump {
+                    syscall: *syscall,
+                    rule_index: *rule_index,
+                },
+                other => other.clone(),
+            };
             let helper_jumps = vec![
-                bpf_stmt(BPF_JMP | BPF_JA, 2),
-                bpf_stmt(BPF_JMP | BPF_JA, u32::from(*offset) + 1),
-                bpf_stmt(BPF_JMP | BPF_JA, u32::from(*offset) + 1),
+                planned_jump(2),
+                planned_jump(*offset + 1),
+                planned_jump(*offset + 1),
             ];
-            accumulator.push(helper_jumps);
+            accumulator.push((helper_location, helper_jumps));
             *offset = 1;
         }
 
-        let condition = condition.into_bpf(*offset);
-        // Safe to unwrap since we checked that offset + `CONDITION_MAX_LEN` does not overflow.
-        *offset += u8::try_from(condition.len()).unwrap();
-        accumulator.push(condition);
+        let condition_bpf = condition.into_bpf(*offset);
+        *offset += condition_bpf.len();
+        accumulator.push((location.clone(), condition_bpf));
     }
-}
 
-impl From<SeccompRule> for BpfProgram {
-    fn from(rule: SeccompRule) -> Self {
-        // Each rule starts with 2 jump statements:
-        // * The first jump enters the rule, attempting a match.
-        // * The second one jumps out of the rule, into the next rule of the syscall or to the
-        //   default action if none of the rules were matched.
-
+    /// Lays out the whole rule into planned BPF instructions, keeping track of the origin of
+    /// every block for error reporting.
+    ///
+    /// # Arguments
+    ///
+    /// * `rule` - The rule to translate.
+    /// * `location` - Location identifying the rule (syscall number and rule index).
+    pub(crate) fn layout(
+        rule: SeccompRule,
+        location: CodegenLocation,
+    ) -> Vec<(CodegenLocation, Vec<PlannedInstruction>)> {
         // Rule is built backwards, because SeccompConditions need to know the jump offset to the
         // next rule, when compiled to BPF.
         let mut accumulator = Vec::with_capacity(
             rule.conditions
                 .len()
-                // Realistically, this overflow should never happen.
-                // If the nr of statements ever overflows `usize`, the rust vector allocation would
-                // anyway fail.
-                .checked_mul(CONDITION_MAX_LEN as usize)
+                .checked_mul(usize::from(CONDITION_MAX_LEN))
                 .unwrap(),
         );
         let mut offset = 1;
 
-        // Conditions are translated into BPF statements and prepended to the rule.
-        rule.conditions.into_iter().for_each(|condition| {
-            SeccompRule::append_condition(condition, &mut accumulator, &mut offset)
-        });
+        // Conditions are translated into planned BPF statements and prepended to the rule.
+        rule.conditions
+            .into_iter()
+            .enumerate()
+            .for_each(|(condition_index, condition)| {
+                let condition_location = CodegenLocation::Condition {
+                    syscall: match &location {
+                        CodegenLocation::Rule { syscall, .. }
+                        | CodegenLocation::Condition { syscall, .. } => *syscall,
+                        _ => None,
+                    },
+                    rule_index: match &location {
+                        CodegenLocation::Rule { rule_index, .. }
+                        | CodegenLocation::Condition { rule_index, .. } => *rule_index,
+                        _ => 0,
+                    },
+                    condition_index,
+                };
+                SeccompRule::layout_condition(
+                    condition,
+                    &condition_location,
+                    &mut accumulator,
+                    &mut offset,
+                )
+            });
 
         // The two initial jump statements are prepended to the rule.
-        accumulator.push(vec![
-            bpf_stmt(BPF_JMP | BPF_JA, 1),
-            bpf_stmt(BPF_JMP | BPF_JA, u32::from(offset) + 1),
-        ]);
+        accumulator.push((
+            location.clone(),
+            vec![planned_jump(1), planned_jump(offset + 1)],
+        ));
 
-        // Finally, builds the translated rule by reversing and consuming the accumulator.
-        let mut result = Vec::new();
+        // The blocks are reversed to obtain the final order of the rule.
+        accumulator.reverse();
         accumulator
-            .into_iter()
-            .rev()
-            .for_each(|mut instructions| result.append(&mut instructions));
+    }
+}
 
-        result
+impl From<SeccompRule> for BpfProgram {
+    fn from(rule: SeccompRule) -> Self {
+        let location = CodegenLocation::Rule {
+            syscall: None,
+            rule_index: 0,
+        };
+        let planned: Vec<PlannedInstruction> = SeccompRule::layout(rule, location)
+            .into_iter()
+            .flat_map(|(_, block)| block)
+            .collect();
+
+        // A standalone rule contains offsets relative to a surrounding rule chain (the on-match
+        // return and the following rule are not part of the rule itself), so whole-program
+        // reachability cannot be checked here. The helper jumps above still guarantee that every
+        // conditional offset fits in a `u8` and every unconditional offset fits in a `u32`.
+        debug_assert!(planned.iter().all(|instruction| match instruction {
+            PlannedInstruction::ConditionalJump { jt, jf, .. } => {
+                *jt <= u8::MAX as usize && *jf <= u8::MAX as usize
+            }
+            PlannedInstruction::Jump { offset } => *offset <= u32::MAX as usize,
+            PlannedInstruction::Statement { .. } => true,
+        }));
+        emit_program(planned)
     }
 }
 

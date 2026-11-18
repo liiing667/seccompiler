@@ -24,6 +24,9 @@ pub const CONDITION_MAX_LEN: u8 = 6;
 // The maximum seccomp-BPF program length allowed by the linux kernel.
 pub const BPF_MAX_LEN: usize = 4096;
 
+// The largest encodable offset of a conditional jump (`jt`/`jf` are `u8`).
+const CONDITIONAL_JUMP_MAX_OFFSET: usize = u8::MAX as usize;
+
 // `struct seccomp_data` offsets and sizes of fields in bytes:
 //
 // ```c
@@ -52,6 +55,131 @@ pub(crate) fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> sock_filter {
     sock_filter { code, jt, jf, k }
 }
 
+/// A BPF instruction whose jump offsets are still expressed as `usize` values.
+///
+/// The layout phase of the compiler produces a sequence of these instructions. Offsets are only
+/// narrowed to the wire format (`u8` for conditional jumps, the `k` field for unconditional jumps)
+/// during the emission phase, after every jump has been proven reachable and the whole program
+/// has been proven to fit within [`BPF_MAX_LEN`]. This keeps all arithmetic in `usize` and makes
+/// it impossible to silently wrap an offset into a smaller type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PlannedInstruction {
+    /// Instruction that never changes the program counter (loads, ALU ops, returns).
+    Statement {
+        /// The operation code.
+        code: u16,
+        /// The operand.
+        k: u32,
+    },
+    /// Conditional jump. `jt`/`jf` are relative offsets in number of instructions.
+    ConditionalJump {
+        /// The operation code.
+        code: u16,
+        /// The operand.
+        k: u32,
+        /// The jump offset in case the operation returns `true`.
+        jt: usize,
+        /// The jump offset in case the operation returns `false`.
+        jf: usize,
+    },
+    /// Unconditional jump. The relative offset is carried in the `k` field of the wire format.
+    Jump {
+        /// Relative offset in number of instructions.
+        offset: usize,
+    },
+}
+
+/// Builds a planned statement.
+#[inline(always)]
+pub(crate) fn planned_stmt(code: u16, k: u32) -> PlannedInstruction {
+    PlannedInstruction::Statement { code, k }
+}
+
+/// Builds a planned conditional jump.
+#[inline(always)]
+pub(crate) fn planned_cond_jump(code: u16, k: u32, jt: usize, jf: usize) -> PlannedInstruction {
+    PlannedInstruction::ConditionalJump { code, k, jt, jf }
+}
+
+/// Builds a planned unconditional jump.
+#[inline(always)]
+pub(crate) fn planned_jump(offset: usize) -> PlannedInstruction {
+    PlannedInstruction::Jump { offset }
+}
+
+/// Builds the planned version of the architecture validation sequence.
+pub(crate) fn build_planned_arch_validation_sequence(
+    target_arch: TargetArch,
+) -> Vec<PlannedInstruction> {
+    let audit_arch_value = target_arch.get_audit_value();
+    vec![
+        planned_stmt(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET as u32),
+        planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, audit_arch_value, 1, 0),
+        planned_stmt(BPF_RET | BPF_K, libc::SECCOMP_RET_KILL_PROCESS),
+    ]
+}
+
+/// Verifies that every jump of a planned program is reachable and encodable.
+///
+/// Each jump target must stay inside the program and every conditional jump offset must fit in a
+/// `u8`, while unconditional jump offsets must fit in the `k` (`u32`) field.
+///
+/// Returns the index of the first offending instruction together with the offending offset,
+/// if any.
+pub(crate) fn find_invalid_jump(program: &[PlannedInstruction]) -> Option<(usize, usize)> {
+    program.iter().enumerate().find_map(|(index, instruction)| {
+        let check = |offset: usize| {
+            // A jump moves the program counter relative to the instruction following the jump,
+            // hence the `index + 1` base.
+            let target = index.checked_add(1)?.checked_add(offset)?;
+            (target < program.len()).then_some(())
+        };
+
+        let offending_offset: Option<usize> = match instruction {
+            PlannedInstruction::Statement { .. } => None,
+            PlannedInstruction::ConditionalJump { jt, jf, .. } => {
+                if *jt > CONDITIONAL_JUMP_MAX_OFFSET || check(*jt).is_none() {
+                    Some(*jt)
+                } else if *jf > CONDITIONAL_JUMP_MAX_OFFSET || check(*jf).is_none() {
+                    Some(*jf)
+                } else {
+                    None
+                }
+            }
+            PlannedInstruction::Jump { offset } => {
+                if *offset > u32::MAX as usize || check(*offset).is_none() {
+                    Some(*offset)
+                } else {
+                    None
+                }
+            }
+        };
+
+        offending_offset.map(|offset| (index, offset))
+    })
+}
+
+/// Emits a validated planned program into the final [`sock_filter`] representation.
+///
+/// The caller must have previously checked the length budget and the jump offsets with
+/// [`find_invalid_jump`]; the narrowing conversions below are therefore infallible.
+pub(crate) fn emit_program(program: Vec<PlannedInstruction>) -> BpfProgram {
+    program
+        .into_iter()
+        .map(|instruction| match instruction {
+            PlannedInstruction::Statement { code, k } => bpf_stmt(code, k),
+            PlannedInstruction::ConditionalJump { code, k, jt, jf } => {
+                bpf_jump(
+                    code, k,
+                    // Safe because the layout validation proved both offsets fit in a `u8`.
+                    jt as u8, jf as u8,
+                )
+            }
+            PlannedInstruction::Jump { offset } => bpf_stmt(BPF_JMP | BPF_JA, offset as u32),
+        })
+        .collect()
+}
+
 // Builds a "statement" BPF instruction.
 //
 // # Arguments
@@ -69,6 +197,7 @@ pub(crate) fn bpf_stmt(code: u16, k: u32) -> sock_filter {
 }
 
 // Builds a sequence of BPF instructions that validate the underlying architecture.
+#[cfg(test)]
 #[inline(always)]
 pub(crate) fn build_arch_validation_sequence(target_arch: TargetArch) -> Vec<sock_filter> {
     let audit_arch_value = target_arch.get_audit_value();
@@ -170,6 +299,71 @@ mod tests {
                 jf: 5,
                 k: 10,
             }
+        );
+    }
+
+    #[test]
+    fn test_find_invalid_jump_accepts_valid_program() {
+        // A conditional jump reaching the last instruction and an unconditional jump in range.
+        let program = vec![
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, 1, 3, 0),
+            planned_jump(2),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, 0),
+            planned_stmt(BPF_LD | BPF_W | BPF_ABS, 0),
+            planned_stmt(BPF_RET | BPF_K, 0),
+        ];
+        assert_eq!(find_invalid_jump(&program), None);
+
+        // Offsets of exactly u8::MAX are encodable as long as the target exists.
+        let mut max_program = vec![planned_cond_jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            0,
+            u8::MAX as usize,
+            0,
+        )];
+        max_program.extend((0..=u8::MAX as usize).map(|_| planned_stmt(BPF_RET | BPF_K, 0)));
+        assert_eq!(find_invalid_jump(&max_program), None);
+    }
+
+    #[test]
+    fn test_find_invalid_jump_detects_u8_overflow() {
+        // Conditional jump offset larger than u8::MAX cannot be encoded without wrapping.
+        let program = vec![
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, u8::MAX as usize + 1, 0),
+            planned_stmt(BPF_RET | BPF_K, 0),
+        ];
+        assert_eq!(find_invalid_jump(&program), Some((0, u8::MAX as usize + 1)));
+    }
+
+    #[test]
+    fn test_find_invalid_jump_detects_escaping_target() {
+        // A jump (even with a small offset) must not escape past the end of the program.
+        let escaping = vec![
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),
+            planned_stmt(BPF_RET | BPF_K, 0),
+        ];
+        assert_eq!(find_invalid_jump(&escaping), Some((0, 5)));
+
+        let escaping_ja = vec![planned_jump(10), planned_stmt(BPF_RET | BPF_K, 0)];
+        assert_eq!(find_invalid_jump(&escaping_ja), Some((0, 10)));
+    }
+
+    #[test]
+    fn test_emit_program_narrows_validated_offsets() {
+        let planned = vec![
+            planned_cond_jump(BPF_JMP | BPF_JEQ | BPF_K, 7, 1, 0),
+            planned_jump(2),
+            planned_stmt(BPF_RET | BPF_K, 1),
+            planned_stmt(BPF_RET | BPF_K, 2),
+        ];
+        assert_eq!(
+            emit_program(planned),
+            vec![
+                bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 7, 1, 0),
+                bpf_stmt(BPF_JMP | BPF_JA, 2),
+                bpf_stmt(BPF_RET | BPF_K, 1),
+                bpf_stmt(BPF_RET | BPF_K, 2),
+            ]
         );
     }
 }
